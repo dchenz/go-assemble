@@ -110,8 +110,8 @@ func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, erro
 // Middleware wraps an endpoint that expects a single file. It will collect
 // chunks in files until it has determined all chunks have been received.
 // For requests that don't have the correct headers, HTTP 400 is returned.
-// In downstream handlers, the request body becomes nil and response cannot be
-// written to (nil). To get the completed file, use assemble.GetFile(r).
+// In downstream handlers, the request body becomes the complete file and
+// response cannot be written to (nil).
 func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fileID := r.Header.Get(a.Config.FileIdentifierHeader)
