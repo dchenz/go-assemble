@@ -16,26 +16,29 @@ router := mux.NewRouter()
 h := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 
     // Get file ID.
-    fileID := assemble.GetFileID(r)
-
-    // Treat it as if it were uploaded as one file in body...
-    //
-    // NOTE:
-    // http.ResponseWriter will be nil. The response is used
-    // to send the final progress update.
-    UploadToObjectStorage(fileID, r.Body)
+    fmt.Println("File ID:", assemble.GetFileID(r))
 
     // Size of uploaded file.
-    fmt.Println(r.Header.Get("Content-Length"))
+    fmt.Println("File size:", r.Header.Get("Content-Length"))
 
     // Mimetype of uploaded file. This should be set on the final
     // chunk request in x-assemble-content-type, otherwise it will
     // default to application/octet-stream.
-    fmt.Println(r.Header.Get("Content-Type"))
+    fmt.Println("File type:", r.Header.Get("Content-Type"))
+
+    // Treat it as if it were uploaded as one file in body...
+    UploadToObjectStorage(fileID, r.Body)
+
+    // NOTE:
+    // http.ResponseWriter will be nil. The response is used
+    // to send the final progress update.
 })
 
 // Use default configuration.
-fileAssembler := assemble.NewFileChunksAssembler(nil)
+fileAssembler, err := assemble.NewFileChunksAssembler(nil)
+if err != nil {
+    panic(err)
+}
 
 // Should only be used on the route handler that needs it.
 router.Handle("/api/upload", fileAssembler.Middleware(h)).Methods("POST")
