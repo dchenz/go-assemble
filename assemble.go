@@ -121,7 +121,7 @@ func (a *FileChunksAssembler) UploadStartHandler(w http.ResponseWriter, r *http.
 		return
 	}
 	uploadID := a.data.createUpload(info)
-	json.NewEncoder(w).Encode(map[string]int64{
+	_ = json.NewEncoder(w).Encode(map[string]int64{
 		"id": uploadID,
 	})
 }

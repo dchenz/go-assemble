@@ -33,37 +33,52 @@
         const f = document.getElementById("file-input");
         const file = f.files[0];
         if (file) {
-          const fileID = Date.now(); // Use a more reliable ID generator
           const chunkSize = 2 ** 24; // 16MB
           const totalChunks = Math.ceil(file.size / chunkSize);
-          for (let i = 0; i < totalChunks; i++) {
-            const chunkBlob = file.slice(i * chunkSize, (i + 1) * chunkSize);
-            fetch("http://localhost:5000/api/upload", {
+
+          const uploadInitResponse = await (
+            await fetch("http://localhost:5000/api/upload/init", {
               method: "POST",
               headers: {
-                // Other headers can go here too, such as Authorization.
-                "x-assemble-file-id": fileID,
-                "x-assemble-chunk-sequence": i,
-                "x-assemble-chunk-total": totalChunks,
-                "x-assemble-content-type": file.type,
+                "Content-Type": "application/json",
               },
-              body: chunkBlob,
+              body: JSON.stringify({
+                total_chunks: totalChunks,
+                metadata: {
+                  name: file.name,
+                  owner: "hello world",
+                  type: file.type,
+                },
+              }),
             })
-              .then((resp) => resp.json())
-              .then((resp) => {
-                const resultDisplay = document.getElementById("file-result");
-                if (resp.error) {
-                  resultDisplay.innerText = resp.error;
-                  resultDisplay.className = "alert alert-warning";
-                } else if (resp.have === resp.want) {
-                  resultDisplay.innerText = `Successfully uploaded file with ID ${fileID}`;
-                  resultDisplay.className = "alert alert-success";
-                } else {
-                  // Not guaranteed to be in ascending order.
-                  resultDisplay.innerText = `Progress: ${resp.have}/${resp.want}`;
-                }
+          ).json();
+
+          for (let i = 0; i < totalChunks; i++) {
+            const chunkBlob = file.slice(i * chunkSize, (i + 1) * chunkSize);
+
+            const chunkResponse = await (
+              await fetch("http://localhost:5000/api/upload/parts", {
+                method: "POST",
+                headers: {
+                  // Other headers can go here too, such as Authorization.
+                  "x-assemble-upload-id": uploadInitResponse.id,
+                  "x-assemble-chunk-id": i,
+                },
+                body: chunkBlob,
               })
-              .catch(console.error);
+            ).json();
+
+            const resultDisplay = document.getElementById("file-result");
+            if (chunkResponse.error) {
+              resultDisplay.innerText = chunkResponse.error;
+              resultDisplay.className = "alert alert-warning";
+            } else if (chunkResponse.have === chunkResponse.want) {
+              resultDisplay.innerText = `Successfully uploaded file with ID ${uploadInitResponse.id}`;
+              resultDisplay.className = "alert alert-success";
+            } else {
+              // Not guaranteed to be in ascending order.
+              resultDisplay.innerText = `Progress: ${chunkResponse.have}/${chunkResponse.want}`;
+            }
           }
         }
       }

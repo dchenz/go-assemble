@@ -38,18 +38,6 @@ func RejectFile(r *http.Request, status int, reason string) {
 	*r = *r.WithContext(ctx)
 }
 
-func containsInvalidCharacters(s string) bool {
-	for _, c := range s {
-		if !(c >= 'A' && c <= 'Z') &&
-			!(c >= 'a' && c <= 'z') &&
-			!(c >= '0' && c <= '9') &&
-			c != '_' && c != '-' {
-			return true
-		}
-	}
-	return false
-}
-
 func getFileSize(path string) (int64, error) {
 	f, err := os.Stat(path)
 	if err != nil {

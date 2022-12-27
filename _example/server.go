@@ -13,14 +13,13 @@ func main() {
 	router := mux.NewRouter()
 
 	// Use default configuration.
-	fileAssembler, err := assemble.NewFileChunksAssembler(nil)
-	if err != nil {
-		panic(err)
-	}
+	fileAssembler := assemble.NewFileChunksAssembler(nil)
 
 	// Should only be used on the route handler that needs it.
-	router.Handle("/api/upload",
-		fileAssembler.Middleware(http.HandlerFunc(fileHandler)),
+	router.Handle("/api/upload/init", http.HandlerFunc(fileAssembler.UploadStartHandler)).Methods("POST")
+
+	router.Handle("/api/upload/parts",
+		fileAssembler.ChunksMiddleware(http.HandlerFunc(fileHandler)),
 	).Methods("POST")
 
 	router.Handle("/", http.HandlerFunc(serveIndex)).Methods("GET")
@@ -37,8 +36,8 @@ func main() {
 }
 
 func fileHandler(_ http.ResponseWriter, r *http.Request) {
-	// Get file ID.
-	fmt.Println("File ID:", assemble.GetFileID(r))
+	// Get file metadata.
+	fmt.Println("File metadata:", assemble.GetFileMetadata(r))
 
 	// Size of uploaded file.
 	fmt.Println("File size:", r.Header.Get("Content-Length"))
