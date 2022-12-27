@@ -13,15 +13,13 @@ import (
 )
 
 const (
-	DefaultFileIdentifierHeader = "x-assemble-file-id"
-	DefaultFileMimeTypeHeader   = "x-assemble-content-type"
-	DefaultChunkSequenceHeader  = "x-assemble-chunk-sequence"
-	DefaultChunkTotalHeader     = "x-assemble-chunk-total"
+	DefaultUploadIdentifierHeader = "x-assemble-upload-id"
+	DefaultChunkIdentifierHeader  = "x-assemble-chunk-id"
 )
 
 type FileChunksAssembler struct {
 	Config *AssemblerConfig
-	data   *sync.Map
+	data   *tracker
 }
 
 type AssemblerConfig struct {
@@ -29,22 +27,12 @@ type AssemblerConfig struct {
 	// Header name for ID of the file being uploaded.
 	//
 	// Default: x-assemble-file-id
-	FileIdentifierHeader string
-
-	// Header name for content type of original file.
-	//
-	// Default: x-assemble-content-type
-	FileMimeTypeHeader string
+	UploadIdentifierHeader string
 
 	// Header name for chunk's sequence number.
 	//
 	// Default: x-assemble-chunk-sequence
-	ChunkSequenceHeader string
-
-	// Header name for total number of chunks.
-	//
-	// Default: x-assemble-chunk-total
-	ChunkTotalHeader string
+	ChunkIdentifierHeader string
 
 	// Path to directory where chunks will be saved.
 	//
@@ -55,29 +43,17 @@ type AssemblerConfig struct {
 	//
 	// Default: $HOME/.go-assemble-data/completed
 	CompletedDir string
-
-	// Don't delete all chunks after combining them
-	// (e.g. want to use cron job instead).
-	//
-	// Default: false
-	KeepCompletedChunks bool
 }
 
 func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, error) {
 	if config == nil {
 		config = &AssemblerConfig{}
 	}
-	if config.FileIdentifierHeader == "" {
-		config.FileIdentifierHeader = DefaultFileIdentifierHeader
+	if config.UploadIdentifierHeader == "" {
+		config.UploadIdentifierHeader = DefaultUploadIdentifierHeader
 	}
-	if config.FileMimeTypeHeader == "" {
-		config.FileMimeTypeHeader = DefaultFileMimeTypeHeader
-	}
-	if config.ChunkSequenceHeader == "" {
-		config.ChunkSequenceHeader = DefaultChunkSequenceHeader
-	}
-	if config.ChunkTotalHeader == "" {
-		config.ChunkTotalHeader = DefaultChunkTotalHeader
+	if config.ChunkIdentifierHeader == "" {
+		config.ChunkIdentifierHeader = DefaultChunkIdentifierHeader
 	}
 	if config.ChunksDir == "" {
 		chunksDirBase, err := os.UserHomeDir()
@@ -101,51 +77,54 @@ func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, erro
 	}
 	a := FileChunksAssembler{
 		Config: config,
-		data:   &sync.Map{},
+		data: &tracker{
+			uploads:      sync.Map{},
+			chunkDir:     config.ChunksDir,
+			completedDir: config.CompletedDir,
+		},
 	}
 	return &a, nil
 }
 
-func (a *FileChunksAssembler) getFileID(r *http.Request) (string, error) {
-	fileID := r.Header.Get(a.Config.FileIdentifierHeader)
-	if fileID == "" {
-		return "", fmt.Errorf("file ID is required")
+func (a *FileChunksAssembler) getActiveUpload(r *http.Request) (*activeUpload, error) {
+	headerVal := r.Header.Get(a.Config.UploadIdentifierHeader)
+	uploadID, err := strconv.ParseInt(headerVal, 10, 64)
+	if err != nil {
+		return nil, err
 	}
-	// File ID should be cleansed as it becomes part of a file name.
-	if containsInvalidCharacters(fileID) {
-		return "", fmt.Errorf("file ID only supports alphanumeric, underscores and hyphens")
+	f, exists := a.data.uploads.Load(uploadID)
+	if !exists {
+		return nil, fmt.Errorf("upload ID not found")
 	}
-	return fileID, nil
+	return f.(*activeUpload), nil
 }
 
-func (a *FileChunksAssembler) getChunkTotal(r *http.Request) (int64, error) {
-	chunkExpectedTotal, err := strconv.ParseInt(
-		r.Header.Get(a.Config.ChunkTotalHeader),
-		10,
-		64,
-	)
+func (a *FileChunksAssembler) getChunkID(r *http.Request) (int64, error) {
+	headerVal := r.Header.Get(a.Config.ChunkIdentifierHeader)
+	chunkSequenceID, err := strconv.ParseInt(headerVal, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("expected chunks must be an integer")
-	}
-	if chunkExpectedTotal <= 0 {
-		return 0, fmt.Errorf("expected chunks must be positive")
-	}
-	return chunkExpectedTotal, nil
-}
-
-func (a *FileChunksAssembler) getChunkSequence(r *http.Request) (int64, error) {
-	chunkSequenceID, err := strconv.ParseInt(
-		r.Header.Get(a.Config.ChunkSequenceHeader),
-		10,
-		64,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("sequence number must be an integer")
+		return 0, fmt.Errorf("must be an integer")
 	}
 	if chunkSequenceID < 0 {
-		return 0, fmt.Errorf("expected chunks cannot be negative")
+		return 0, fmt.Errorf("cannot be negative")
 	}
 	return chunkSequenceID, nil
+}
+
+func (a *FileChunksAssembler) UploadStartHandler(w http.ResponseWriter, r *http.Request) {
+	var info fileInfo
+	if err := json.NewDecoder(r.Body).Decode(&info); err != nil {
+		badRequest(w, err)
+		return
+	}
+	if info.TotalChunks == 0 {
+		badRequest(w, fmt.Errorf("invalid number of expected chunks"))
+		return
+	}
+	uploadID := a.data.createUpload(info)
+	json.NewEncoder(w).Encode(map[string]int64{
+		"id": uploadID,
+	})
 }
 
 // Middleware wraps an endpoint that expects a single file. It will collect
@@ -153,25 +132,24 @@ func (a *FileChunksAssembler) getChunkSequence(r *http.Request) (int64, error) {
 // For requests that don't have the correct headers, HTTP 400 is returned.
 // In downstream handlers, the request body becomes the complete file and
 // response cannot be written to (nil).
-func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
+func (a *FileChunksAssembler) ChunksMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fileID, err := a.getFileID(r)
+		currentUpload, err := a.getActiveUpload(r)
 		if err != nil {
 			badRequest(w, err)
 			return
 		}
-		chunkExpectedTotal, err := a.getChunkTotal(r)
+		// For each file being uploaded, only one chunk can be processed at a time.
+		currentUpload.lock.Lock()
+		defer currentUpload.lock.Unlock()
+
+		chunkSequenceID, err := a.getChunkID(r)
 		if err != nil {
 			badRequest(w, err)
 			return
 		}
-		chunkSequenceID, err := a.getChunkSequence(r)
-		if err != nil {
-			badRequest(w, err)
-			return
-		}
-		if chunkSequenceID >= chunkExpectedTotal {
-			badRequest(w, fmt.Errorf("sequence number must be between 0 and N"))
+		if chunkSequenceID >= currentUpload.info.TotalChunks {
+			badRequest(w, fmt.Errorf("invalid chunk ID"))
 			return
 		}
 		chunkData, err := ioutil.ReadAll(r.Body)
@@ -183,32 +161,26 @@ func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 			badRequest(w, fmt.Errorf("chunk cannot be empty"))
 			return
 		}
-		f := a.getFileOrAdd(fileID, chunkSequenceID, chunkExpectedTotal)
-		f.lock.Lock()
-		defer f.lock.Unlock()
-		if f.expectedTotal != chunkExpectedTotal {
-			badRequest(w, ErrChunkQuantityChange)
-			return
-		}
-		if err := a.add(fileID, chunkSequenceID, chunkData); err != nil {
+		if err := a.data.addChunk(currentUpload, chunkSequenceID, chunkData); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		response := progressResponse{
-			CurrentChunks:  a.countChunks(fileID),
-			ExpectedChunks: a.totalChunks(fileID),
+			CurrentChunks:  currentUpload.countChunks(),
+			ExpectedChunks: currentUpload.totalChunks(),
 		}
-		if a.isComplete(fileID) {
-			completedFilePath, err := a.combineChunks(fileID)
+		if currentUpload.countChunks() == currentUpload.totalChunks() {
+			completedFilePath, err := a.data.combineChunks(currentUpload)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
-			contentType := r.Header.Get(a.Config.FileMimeTypeHeader)
-			if contentType == "" {
+
+			contentType := currentUpload.info.Metadata["type"]
+			if contentType == nil {
 				contentType = "application/octet-stream"
 			}
-			r.Header.Set("Content-Type", contentType)
+			r.Header.Set("Content-Type", contentType.(string))
 
 			contentLength, err := getFileSize(completedFilePath)
 			if err != nil {
@@ -218,10 +190,8 @@ func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 			r.Header.Set("Content-Length", strconv.FormatInt(contentLength, 10))
 
 			// Remove chunk-specific headers from request.
-			r.Header.Del(a.Config.FileIdentifierHeader)
-			r.Header.Del(a.Config.FileMimeTypeHeader)
-			r.Header.Del(a.Config.ChunkSequenceHeader)
-			r.Header.Del(a.Config.ChunkTotalHeader)
+			r.Header.Del(a.Config.UploadIdentifierHeader)
+			r.Header.Del(a.Config.ChunkIdentifierHeader)
 
 			// Add the file stream as request body.
 			f, err := os.Open(completedFilePath)
@@ -232,9 +202,11 @@ func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 			defer func() { _ = f.Close() }()
 			r.Body = f
 
-			// Downstream requests should use assemble.GetFileID(r).
-			ctx := context.WithValue(r.Context(), contextKey("id"), fileID)
-
+			ctx := context.WithValue(
+				r.Context(),
+				contextKey("metadata"),
+				currentUpload.info.Metadata,
+			)
 			// Cannot send a response downstream as it's used for the final progress update.
 			req := *r.WithContext(ctx)
 			h.ServeHTTP(nil, &req)

@@ -26,14 +26,9 @@ func badRequest(w http.ResponseWriter, err error) {
 
 type contextKey string
 
-// GetFileID returns the ID of the assembled upload. If the request is
-// not wrapped by go-assemble and has no file ID, this method will panic.
-func GetFileID(r *http.Request) string {
-	fileID := r.Context().Value(contextKey("id"))
-	if fileID == nil {
-		panic("GetFileID can only be used inside handlers wrapped by go-assemble")
-	}
-	return fileID.(string)
+func GetFileMetadata(r *http.Request) map[string]interface{} {
+	m := r.Context().Value(contextKey("metadata"))
+	return m.(map[string]interface{})
 }
 
 func RejectFile(r *http.Request, status int, reason string) {

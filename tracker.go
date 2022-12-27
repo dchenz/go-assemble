@@ -1,7 +1,6 @@
 package assemble
 
 import (
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -9,97 +8,99 @@ import (
 	"sync"
 )
 
-type file struct {
-	chunkSet      map[int64]interface{}
-	expectedTotal int64
-	lock          sync.Mutex
+type fileInfo struct {
+	TotalChunks int64                  `json:"total_chunks"`
+	Metadata    map[string]interface{} `json:"metadata"`
 }
 
-var ErrChunkQuantityChange = errors.New("cannot change expected number of chunks")
-
-func (a *FileChunksAssembler) getFile(fileID string) *file {
-	f, exists := a.data.Load(fileID)
-	if !exists {
-		return nil
-	}
-	return f.(*file)
+type activeUpload struct {
+	id     int64
+	info   fileInfo
+	chunks map[int64]interface{}
+	lock   sync.Mutex
 }
 
-func (a *FileChunksAssembler) getFileOrAdd(fileID string, chunkID int64, total int64) *file {
-	f := a.getFile(fileID)
-	if f == nil {
-		f = &file{
-			chunkSet:      make(map[int64]interface{}),
-			expectedTotal: total,
-		}
-		a.data.Store(fileID, f)
-	}
-	return f
+type tracker struct {
+	uploads      sync.Map
+	nextID       int64
+	lock         sync.Mutex
+	chunkDir     string
+	completedDir string
 }
 
-func (a *FileChunksAssembler) add(fileID string, chunkID int64, data []byte) error {
-	chunkFilePath := path.Join(a.Config.ChunksDir, fmt.Sprintf("%s-%d", fileID, chunkID))
-	if err := ioutil.WriteFile(chunkFilePath, data, 0644); err != nil {
+func (a *tracker) createUpload(info fileInfo) int64 {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+	id := a.nextID
+	a.uploads.Store(id, &activeUpload{
+		id:     id,
+		info:   info,
+		chunks: make(map[int64]interface{}),
+	})
+	a.nextID++
+	return id
+}
+
+func (a *tracker) addChunk(f *activeUpload, chunkID int64, chunkData []byte) error {
+	chunkFilePath := a.chunkFilePath(f.id, chunkID)
+	if err := ioutil.WriteFile(chunkFilePath, chunkData, 0644); err != nil {
 		return err
 	}
-	a.getFile(fileID).chunkSet[chunkID] = nil
+	f.chunks[chunkID] = nil
 	return nil
 }
 
-func (a *FileChunksAssembler) delete(fileID string, chunkID int64) error {
-	chunkFilePath := path.Join(a.Config.ChunksDir, fmt.Sprintf("%s-%d", fileID, chunkID))
-	if err := os.Remove(chunkFilePath); err != nil {
+func (a *tracker) deleteChunk(f *activeUpload, chunkID int64) error {
+	if err := os.Remove(a.chunkFilePath(f.id, chunkID)); err != nil {
 		return err
 	}
-	f := a.getFile(fileID)
-	delete(f.chunkSet, chunkID)
-	if len(f.chunkSet) == 0 {
-		a.data.Delete(fileID)
-	}
+	delete(f.chunks, chunkID)
 	return nil
 }
 
-func (a *FileChunksAssembler) isComplete(fileID string) bool {
-	return a.countChunks(fileID) == a.totalChunks(fileID)
+func (f *activeUpload) countChunks() int64 {
+	return int64(len(f.chunks))
 }
 
-func (a *FileChunksAssembler) countChunks(fileID string) int64 {
-	f := a.getFile(fileID)
-	return int64(len(f.chunkSet))
+func (f *activeUpload) totalChunks() int64 {
+	return f.info.TotalChunks
 }
 
-func (a *FileChunksAssembler) totalChunks(fileID string) int64 {
-	f := a.getFile(fileID)
-	return f.expectedTotal
-}
-
-func (a *FileChunksAssembler) combineChunks(fileID string) (string, error) {
-	if !a.isComplete(fileID) {
+func (a *tracker) combineChunks(f *activeUpload) (string, error) {
+	if f.countChunks() < f.totalChunks() {
 		return "", nil
 	}
-	completedFilePath := path.Join(a.Config.CompletedDir, fileID)
-	f, err := os.Create(completedFilePath)
+	completedFilePath := a.completedFilePath(f.id)
+	finalFile, err := os.Create(completedFilePath)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	totalChunks := a.totalChunks(fileID)
+	defer finalFile.Close()
+	totalChunks := f.totalChunks()
 	for i := int64(0); i < totalChunks; i++ {
-		chunkFilePath := path.Join(a.Config.ChunksDir, fmt.Sprintf("%s-%d", fileID, i))
-		chunk, err := os.ReadFile(chunkFilePath)
+		chunk, err := os.ReadFile(a.chunkFilePath(f.id, i))
 		if err != nil {
 			return "", err
 		}
-		if _, err := f.Write(chunk); err != nil {
+		if _, err := finalFile.Write(chunk); err != nil {
 			return "", err
 		}
 	}
-	if !a.Config.KeepCompletedChunks {
-		go func() {
-			for i := int64(0); i < totalChunks; i++ {
-				_ = a.delete(fileID, i)
+	go func() {
+		for i := int64(0); i < totalChunks; i++ {
+			_ = a.deleteChunk(f, i)
+			if len(f.chunks) == 0 {
+				a.uploads.Delete(f.id)
 			}
-		}()
-	}
+		}
+	}()
 	return completedFilePath, nil
+}
+
+func (a *tracker) chunkFilePath(uploadID int64, chunkID int64) string {
+	return path.Join(a.chunkDir, fmt.Sprintf("%d-%d", uploadID, chunkID))
+}
+
+func (a *tracker) completedFilePath(uploadID int64) string {
+	return path.Join(a.completedDir, fmt.Sprintf("%d", uploadID))
 }
