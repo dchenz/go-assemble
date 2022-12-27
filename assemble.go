@@ -3,6 +3,7 @@ package assemble
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -20,9 +21,7 @@ const (
 
 type FileChunksAssembler struct {
 	Config *AssemblerConfig
-	data   map[string]*file
-	// Locks FileChunksAssembler.data. Config should be constant.
-	lock sync.Mutex
+	data   *sync.Map
 }
 
 type AssemblerConfig struct {
@@ -102,9 +101,51 @@ func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, erro
 	}
 	a := FileChunksAssembler{
 		Config: config,
-		data:   make(map[string]*file),
+		data:   &sync.Map{},
 	}
 	return &a, nil
+}
+
+func (a *FileChunksAssembler) getFileID(r *http.Request) (string, error) {
+	fileID := r.Header.Get(a.Config.FileIdentifierHeader)
+	if fileID == "" {
+		return "", fmt.Errorf("file ID is required")
+	}
+	// File ID should be cleansed as it becomes part of a file name.
+	if containsInvalidCharacters(fileID) {
+		return "", fmt.Errorf("file ID only supports alphanumeric, underscores and hyphens")
+	}
+	return fileID, nil
+}
+
+func (a *FileChunksAssembler) getChunkTotal(r *http.Request) (int64, error) {
+	chunkExpectedTotal, err := strconv.ParseInt(
+		r.Header.Get(a.Config.ChunkTotalHeader),
+		10,
+		64,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expected chunks must be an integer")
+	}
+	if chunkExpectedTotal <= 0 {
+		return 0, fmt.Errorf("expected chunks must be positive")
+	}
+	return chunkExpectedTotal, nil
+}
+
+func (a *FileChunksAssembler) getChunkSequence(r *http.Request) (int64, error) {
+	chunkSequenceID, err := strconv.ParseInt(
+		r.Header.Get(a.Config.ChunkSequenceHeader),
+		10,
+		64,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("sequence number must be an integer")
+	}
+	if chunkSequenceID < 0 {
+		return 0, fmt.Errorf("expected chunks cannot be negative")
+	}
+	return chunkSequenceID, nil
 }
 
 // Middleware wraps an endpoint that expects a single file. It will collect
@@ -114,40 +155,23 @@ func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, erro
 // response cannot be written to (nil).
 func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fileID := r.Header.Get(a.Config.FileIdentifierHeader)
-		if fileID == "" {
-			badRequest(w, "file ID is required")
-			return
-		}
-		// File ID should be cleansed as it becomes part of a file name.
-		if containsInvalidCharacters(fileID) {
-			badRequest(w, "file ID only supports alphanumeric, underscores and hyphens")
-			return
-		}
-		chunkExpectedTotal, err := strconv.ParseInt(
-			r.Header.Get(a.Config.ChunkTotalHeader),
-			10,
-			64,
-		)
+		fileID, err := a.getFileID(r)
 		if err != nil {
-			badRequest(w, "expected chunks must be an integer")
+			badRequest(w, err)
 			return
 		}
-		if chunkExpectedTotal <= 0 {
-			badRequest(w, "expected chunks cannot be negative")
-			return
-		}
-		chunkSequenceID, err := strconv.ParseInt(
-			r.Header.Get(a.Config.ChunkSequenceHeader),
-			10,
-			64,
-		)
+		chunkExpectedTotal, err := a.getChunkTotal(r)
 		if err != nil {
-			badRequest(w, "sequence number must be an integer")
+			badRequest(w, err)
 			return
 		}
-		if chunkSequenceID < 0 || chunkSequenceID >= chunkExpectedTotal {
-			badRequest(w, "sequence number must be between 0 and N")
+		chunkSequenceID, err := a.getChunkSequence(r)
+		if err != nil {
+			badRequest(w, err)
+			return
+		}
+		if chunkSequenceID >= chunkExpectedTotal {
+			badRequest(w, fmt.Errorf("sequence number must be between 0 and N"))
 			return
 		}
 		chunkData, err := ioutil.ReadAll(r.Body)
@@ -156,32 +180,30 @@ func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 			return
 		}
 		if len(chunkData) == 0 {
-			badRequest(w, "chunk cannot be empty")
+			badRequest(w, fmt.Errorf("chunk cannot be empty"))
 			return
 		}
-		a.lock.Lock()
-		if err := a.addFileIfNotExists(fileID, chunkSequenceID, chunkExpectedTotal); err != nil {
-			badRequest(w, err.Error())
-			a.lock.Unlock()
+		f := a.getFileOrAdd(fileID, chunkSequenceID, chunkExpectedTotal)
+		f.lock.Lock()
+		defer f.lock.Unlock()
+		if f.expectedTotal != chunkExpectedTotal {
+			badRequest(w, ErrChunkQuantityChange)
 			return
 		}
 		if err := a.add(fileID, chunkSequenceID, chunkData); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
-			a.lock.Unlock()
 			return
 		}
-		var response progressResponse
+		response := progressResponse{
+			CurrentChunks:  a.countChunks(fileID),
+			ExpectedChunks: a.totalChunks(fileID),
+		}
 		if a.isComplete(fileID) {
 			completedFilePath, err := a.combineChunks(fileID)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
-				a.lock.Unlock()
 				return
 			}
-			response.CurrentChunks = a.countChunks(fileID)
-			response.ExpectedChunks = a.totalChunks(fileID)
-			a.lock.Unlock()
-
 			contentType := r.Header.Get(a.Config.FileMimeTypeHeader)
 			if contentType == "" {
 				contentType = "application/octet-stream"
@@ -223,10 +245,6 @@ func (a *FileChunksAssembler) Middleware(h http.Handler) http.Handler {
 				response.RejectedError = &rejectedFileErr
 				w.WriteHeader(rejectedFileCode.(int))
 			}
-		} else {
-			response.CurrentChunks = a.countChunks(fileID)
-			response.ExpectedChunks = a.totalChunks(fileID)
-			a.lock.Unlock()
 		}
 		w.Header().Add("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(response)

@@ -6,25 +6,35 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"sync"
 )
 
 type file struct {
 	chunkSet      map[int64]interface{}
 	expectedTotal int64
+	lock          sync.Mutex
 }
 
 var ErrChunkQuantityChange = errors.New("cannot change expected number of chunks")
 
-func (a *FileChunksAssembler) addFileIfNotExists(fileID string, chunkID int64, total int64) error {
-	if !a.exists(fileID) {
-		a.data[fileID] = &file{
+func (a *FileChunksAssembler) getFile(fileID string) *file {
+	f, exists := a.data.Load(fileID)
+	if !exists {
+		return nil
+	}
+	return f.(*file)
+}
+
+func (a *FileChunksAssembler) getFileOrAdd(fileID string, chunkID int64, total int64) *file {
+	f := a.getFile(fileID)
+	if f == nil {
+		f = &file{
 			chunkSet:      make(map[int64]interface{}),
 			expectedTotal: total,
 		}
-	} else if a.data[fileID].expectedTotal != total {
-		return ErrChunkQuantityChange
+		a.data.Store(fileID, f)
 	}
-	return nil
+	return f
 }
 
 func (a *FileChunksAssembler) add(fileID string, chunkID int64, data []byte) error {
@@ -32,7 +42,7 @@ func (a *FileChunksAssembler) add(fileID string, chunkID int64, data []byte) err
 	if err := ioutil.WriteFile(chunkFilePath, data, 0644); err != nil {
 		return err
 	}
-	a.data[fileID].chunkSet[chunkID] = nil
+	a.getFile(fileID).chunkSet[chunkID] = nil
 	return nil
 }
 
@@ -41,10 +51,10 @@ func (a *FileChunksAssembler) delete(fileID string, chunkID int64) error {
 	if err := os.Remove(chunkFilePath); err != nil {
 		return err
 	}
-	f := a.data[fileID]
+	f := a.getFile(fileID)
 	delete(f.chunkSet, chunkID)
 	if len(f.chunkSet) == 0 {
-		delete(a.data, fileID)
+		a.data.Delete(fileID)
 	}
 	return nil
 }
@@ -54,18 +64,13 @@ func (a *FileChunksAssembler) isComplete(fileID string) bool {
 }
 
 func (a *FileChunksAssembler) countChunks(fileID string) int64 {
-	f := a.data[fileID]
+	f := a.getFile(fileID)
 	return int64(len(f.chunkSet))
 }
 
 func (a *FileChunksAssembler) totalChunks(fileID string) int64 {
-	f := a.data[fileID]
+	f := a.getFile(fileID)
 	return f.expectedTotal
-}
-
-func (a *FileChunksAssembler) exists(fileID string) bool {
-	_, exists := a.data[fileID]
-	return exists
 }
 
 func (a *FileChunksAssembler) combineChunks(fileID string) (string, error) {

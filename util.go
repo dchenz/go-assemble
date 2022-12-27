@@ -16,11 +16,11 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-func badRequest(w http.ResponseWriter, message string) {
+func badRequest(w http.ResponseWriter, err error) {
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)
 	_ = json.NewEncoder(w).Encode(errorResponse{
-		Error: message,
+		Error: err.Error(),
 	})
 }
 
