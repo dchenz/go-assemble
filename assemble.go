@@ -45,7 +45,7 @@ type AssemblerConfig struct {
 	CompletedDir string
 }
 
-func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, error) {
+func NewFileChunksAssembler(config *AssemblerConfig) *FileChunksAssembler {
 	if config == nil {
 		config = &AssemblerConfig{}
 	}
@@ -58,24 +58,24 @@ func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, erro
 	if config.ChunksDir == "" {
 		chunksDirBase, err := os.UserHomeDir()
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
 		config.ChunksDir = path.Join(chunksDirBase, ".go-assemble-data", "chunks")
 		if err := os.MkdirAll(config.ChunksDir, 0755); err != nil {
-			return nil, err
+			panic(err)
 		}
 	}
 	if config.CompletedDir == "" {
 		completedDirBase, err := os.UserHomeDir()
 		if err != nil {
-			return nil, err
+			panic(err)
 		}
 		config.CompletedDir = path.Join(completedDirBase, ".go-assemble-data", "completed")
 		if err := os.MkdirAll(config.CompletedDir, 0755); err != nil {
-			return nil, err
+			panic(err)
 		}
 	}
-	a := FileChunksAssembler{
+	return &FileChunksAssembler{
 		Config: config,
 		data: &tracker{
 			uploads:      sync.Map{},
@@ -83,7 +83,6 @@ func NewFileChunksAssembler(config *AssemblerConfig) (*FileChunksAssembler, erro
 			completedDir: config.CompletedDir,
 		},
 	}
-	return &a, nil
 }
 
 func (a *FileChunksAssembler) getActiveUpload(r *http.Request) (*activeUpload, error) {

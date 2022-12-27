@@ -187,4 +187,4 @@ type AssemblerConfig struct {
 }
 ```
 
-If ``ChunksDir`` or ``CompletedDir`` aren't provided, it will create and use the default directories. If they are provided, it does not check if the directories exist and will raise an error if accessed.
+If ``ChunksDir`` or ``CompletedDir`` aren't provided, it will try to create and use default directories in ``$HOME``, otherwise it panics. If provided, it does not check if the directories actually exist.
